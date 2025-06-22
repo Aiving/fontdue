@@ -391,6 +391,177 @@ impl<'a, U: Copy + Clone> Layout<U> {
         self.height = 0.0;
     }
 
+    pub fn set_max_width(&mut self, max_width: Option<f32>) {
+        self.max_width = max_width.unwrap_or(core::f32::MAX);
+    }
+
+    pub fn measure<T: Borrow<Font>>(
+        &self,
+        fonts: &[T],
+        style: &TextStyle<U>,
+        max_width: Option<f32>,
+    ) -> Vec<GlyphPosition<U>> {
+        // The first layout pass requires some text.
+        if style.text.is_empty() {
+            return Vec::new();
+        }
+
+        let mut glyphs = Vec::new();
+        let mut linebreaker = self.linebreaker;
+        let mut line_metrics = vec![LinePosition::default()];
+
+        let max_width = max_width.unwrap_or(core::f32::MAX);
+        let mut linebreak_prev = LINEBREAK_NONE;
+        let mut linebreak_pos = 0.0;
+        let mut linebreak_idx = 0;
+        let mut current_pos = 0.0;
+        let mut current_ascent = 0.0;
+        let mut current_descent = 0.0;
+        let mut current_line_gap = 0.0;
+        let mut current_new_line = 0.0;
+        let mut start_pos = 0.0;
+        let mut height = 0.0;
+
+        let font: &Font = &fonts[style.font_index].borrow();
+
+        if let Some(metrics) = font.horizontal_line_metrics(style.px) {
+            current_ascent = ceil(metrics.ascent);
+            current_new_line = ceil(metrics.new_line_size);
+            current_descent = ceil(metrics.descent);
+            current_line_gap = ceil(metrics.line_gap);
+
+            if let Some(line) = line_metrics.last_mut() {
+                if current_ascent > line.max_ascent {
+                    line.max_ascent = current_ascent;
+                }
+                if current_descent < line.min_descent {
+                    line.min_descent = current_descent;
+                }
+                if current_line_gap > line.max_line_gap {
+                    line.max_line_gap = current_line_gap;
+                }
+                if current_new_line > line.max_new_line_size {
+                    line.max_new_line_size = current_new_line;
+                }
+            }
+        }
+
+        let mut byte_offset = 0;
+        while byte_offset < style.text.len() {
+            let prev_byte_offset = byte_offset;
+            let character = read_utf8(style.text.as_bytes(), &mut byte_offset);
+            let linebreak = linebreaker.next(character).mask(self.wrap_mask);
+            let glyph_index = font.lookup_glyph_index(character);
+            let char_data = CharacterData::classify(character, glyph_index);
+            let metrics = if !char_data.is_control() {
+                font.metrics_indexed(glyph_index, style.px)
+            } else {
+                Metrics::default()
+            };
+            let advance = ceil(metrics.advance_width);
+
+            if linebreak >= linebreak_prev {
+                linebreak_prev = linebreak;
+                linebreak_pos = current_pos;
+                linebreak_idx = glyphs.len().saturating_sub(1); // Mark the previous glyph
+            }
+
+            // Perform a linebreak
+            if linebreak.is_hard() || (current_pos - start_pos + advance > max_width) {
+                linebreak_prev = LINEBREAK_NONE;
+                let mut next_glyph_start = glyphs.len();
+                if let Some(line) = line_metrics.last_mut() {
+                    line.glyph_end = linebreak_idx;
+                    line.padding = max_width - (linebreak_pos - start_pos);
+                    height += line.max_new_line_size * self.line_height;
+                    next_glyph_start = linebreak_idx + 1;
+                }
+                line_metrics.push(LinePosition {
+                    baseline_y: 0.0,
+                    padding: 0.0,
+                    max_ascent: current_ascent,
+                    min_descent: current_descent,
+                    max_line_gap: current_line_gap,
+                    max_new_line_size: current_new_line,
+                    glyph_start: next_glyph_start,
+                    glyph_end: 0,
+                    tracking_x: linebreak_pos,
+                });
+                start_pos = linebreak_pos;
+            }
+
+            let y = if self.flip {
+                floor(-metrics.bounds.height - metrics.bounds.ymin) // PositiveYDown
+            } else {
+                floor(metrics.bounds.ymin) // PositiveYUp
+            };
+
+            glyphs.push(GlyphPosition {
+                key: GlyphRasterConfig {
+                    glyph_index: glyph_index as u16,
+                    px: style.px,
+                    font_hash: font.file_hash(),
+                },
+                font_index: style.font_index,
+                parent: character,
+                byte_offset: prev_byte_offset,
+                x: floor(current_pos + metrics.bounds.xmin),
+                y,
+                width: metrics.width,
+                height: metrics.height,
+                char_data,
+                user_data: style.user_data,
+            });
+            current_pos += advance;
+        }
+
+        if let Some(line) = line_metrics.last_mut() {
+            line.padding = self.max_width - (current_pos - start_pos);
+            line.glyph_end = glyphs.len().saturating_sub(1);
+        }
+
+        // The second layout pass requires at least 1 glyph to layout.
+        if glyphs.is_empty() {
+            return Vec::new();
+        }
+
+        let mut output = Vec::with_capacity(glyphs.len());
+
+        let dir = if self.flip {
+            -1.0 // PositiveYDown
+        } else {
+            1.0 // PositiveYUp
+        };
+
+        let mut baseline_y = self.y
+            - dir
+                * floor(
+                    (self.max_height
+                        - if let Some(line) = line_metrics.last() {
+                            height + line.max_new_line_size
+                        } else {
+                            0.0
+                        })
+                        * self.vertical_align,
+                );
+        let mut idx = 0;
+        for line in &mut line_metrics {
+            let x_padding = self.x - line.tracking_x + floor(line.padding * self.horizontal_align);
+            baseline_y -= dir * line.max_ascent;
+            line.baseline_y = baseline_y;
+            while idx <= line.glyph_end {
+                let mut glyph = glyphs[idx];
+                glyph.x += x_padding;
+                glyph.y += baseline_y;
+                output.push(glyph);
+                idx += 1;
+            }
+            baseline_y -= dir * (line.max_new_line_size * self.line_height - line.max_ascent);
+        }
+
+        output
+    }
+
     /// Gets the current height of the appended text.
     pub fn height(&self) -> f32 {
         if let Some(line) = self.line_metrics.last() {
